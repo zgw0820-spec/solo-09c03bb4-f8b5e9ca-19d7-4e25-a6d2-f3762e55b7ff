@@ -35,6 +35,23 @@
     <p class="hint">也可以把 JSON 直接粘贴到下面，然后点“开始试算”。</p>
     <textarea id="json-input" spellcheck="false" aria-label="JSON 清单"></textarea>
 
+    <div class="option-grid">
+      <label class="option-field">
+        <span>最低上线 Pod 数</span>
+        <input id="min-pods" type="number" min="0" max="6" step="1"
+               placeholder="不填则只做试算" inputmode="numeric">
+      </label>
+      <label class="option-field">
+        <span>求解时限（毫秒）</span>
+        <input id="time-limit" type="number" min="1" step="1"
+               placeholder="不填则精确试算" inputmode="numeric">
+      </label>
+    </div>
+    <p class="hint">
+      填写最低上线数后给出发布判定：够数显示「可上线」，上界仍不够提示「推迟」，其余「待复核」。
+      填写时限后到时停止搜索，输出当前最好分配与可启动数量上界；不填时限则完整精确求解。
+    </p>
+
     <div class="actions">
       <button id="run-btn" class="btn primary" type="button">开始试算</button>
       <span id="status" class="status" role="status" aria-live="polite"></span>
@@ -77,13 +94,15 @@
     </div>
 
     <div id="results" hidden>
+      <div id="release-banner" class="release-banner" hidden></div>
+      <div id="search-info" class="search-info"></div>
       <div class="summary-grid" id="summary-grid"></div>
       <div id="warnings" class="warnings" hidden></div>
 
       <h3>可同时启动的 Pod</h3>
       <div id="scheduled-list" class="pod-list"></div>
 
-      <h3>未排上的 Pod</h3>
+      <h3 id="unscheduled-title">未排上的 Pod</h3>
       <div id="unscheduled-list" class="pod-list"></div>
 
       <h3>PV 使用情况</h3>

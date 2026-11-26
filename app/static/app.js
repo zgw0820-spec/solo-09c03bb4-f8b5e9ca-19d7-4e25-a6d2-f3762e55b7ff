@@ -12,10 +12,21 @@ const errorBox = $("#error-box");
 const emptyState = $("#empty-state");
 const resultsEl = $("#results");
 const badge = $("#result-badge");
+const minPodsInput = $("#min-pods");
+const timeLimitInput = $("#time-limit");
 
 function setStatus(text, kind) {
   statusEl.textContent = text;
   statusEl.className = "status" + (kind ? " " + kind : "");
+}
+
+function optionPayload(sourceText) {
+  const body = { json_text: sourceText };
+  const minPods = minPodsInput.value.trim();
+  const timeLimit = timeLimitInput.value.trim();
+  if (minPods !== "") body.min_pods = Number(minPods);
+  if (timeLimit !== "") body.time_limit_ms = Number(timeLimit);
+  return body;
 }
 
 function escapeHtml(value) {
@@ -56,7 +67,7 @@ async function runPlan(sourceText) {
     const resp = await fetch("/api/plan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ json_text: sourceText }),
+      body: JSON.stringify(optionPayload(sourceText)),
     });
     const data = await resp.json();
 
@@ -71,11 +82,22 @@ async function runPlan(sourceText) {
     render(data);
     const s = data.summary;
     setStatus(
-      "完成：" + s.scheduled_count + "/" + s.pod_count + " 个 Pod 可启动"
+      "完成：可启动 " +
+        s.lower_bound +
+        " 个（上界 " +
+        s.upper_bound +
+        " 个），共 " +
+        s.pod_count +
+        " 个 Pod" +
+        (s.timed_out ? "，已到时停止" : "")
     );
-    badge.textContent =
-      s.unscheduled_count === 0 ? "全部可启动" : s.unscheduled_count + " 个待复核";
-    badge.className = "badge " + (s.unscheduled_count === 0 ? "ok" : "warn");
+    if (s.optimal) {
+      badge.textContent = "已证最优";
+      badge.className = "badge ok";
+    } else {
+      badge.textContent = "未证最优 · 待确认";
+      badge.className = "badge warn";
+    }
   } catch (err) {
     showErrors(["网络或服务错误：" + err.message]);
     setStatus("出错了", "error");
@@ -97,13 +119,14 @@ function stat(label, value, kind) {
 }
 
 function renderPod(pod) {
-  const cls = pod.scheduled ? "scheduled" : "unscheduled";
+  const cls = pod.scheduled ? "scheduled" : pod.status === "unconfirmed" ? "unconfirmed" : "unscheduled";
   let html = '<article class="pod-card ' + cls + '">';
   html += '<div class="pod-top"><span class="pod-name">' + escapeHtml(pod.name) + "</span>";
   if (pod.scheduled) {
     html += '<span class="pod-node">' + escapeHtml(pod.node) + "</span>";
   } else {
-    html += '<span class="pod-node" style="color:#ffb4ae;background:rgba(248,81,73,.1);border-color:rgba(248,81,73,.35)">未排上</span>';
+    const label = pod.status === "unconfirmed" ? "待确认" : "未排上";
+    html += '<span class="pod-node pod-node-' + escapeHtml(pod.status) + '">' + label + "</span>";
   }
   html += "</div>";
 
@@ -132,13 +155,65 @@ function renderPod(pod) {
   return html;
 }
 
+function renderReleaseBanner(data) {
+  const banner = $("#release-banner");
+  const release = data.release;
+  if (!release || release.min_pods === null) {
+    banner.hidden = true;
+    banner.textContent = "";
+    return;
+  }
+  const labelMap = {
+    go: ["可上线", "release-go"],
+    postpone: ["建议推迟", "release-postpone"],
+    review: ["待复核", "release-review"],
+  };
+  const [label, cls] = labelMap[release.status] || ["待复核", "release-review"];
+  banner.className = "release-banner " + cls;
+  banner.innerHTML =
+    '<span class="release-tag">' +
+    label +
+    "</span><span class=\"release-text\">" +
+    escapeHtml(release.status_text) +
+    "</span>";
+  banner.hidden = false;
+}
+
+function renderSearchInfo(data) {
+  const s = data.search;
+  const parts = [];
+  parts.push(
+    s.optimal
+      ? "已完整试算，上下界相等（" + s.lower_bound + "），结果为最优"
+      : "时限内停止搜索，未证最优：下界 " + s.lower_bound + " / 上界 " + s.upper_bound
+  );
+  if (s.time_limit_ms !== null) {
+    parts.push("时限 " + s.time_limit_ms + " ms");
+  }
+  parts.push("实际耗时 " + s.elapsed_ms + " ms");
+  $("#search-info").innerHTML = parts
+    .map((p) => "<span>" + escapeHtml(p) + "</span>")
+    .join("");
+}
+
 function render(data) {
   const s = data.summary;
+  renderReleaseBanner(data);
+  renderSearchInfo(data);
+
   $("#summary-grid").innerHTML =
-    stat("可同时启动", s.scheduled_count + " / " + s.pod_count, s.scheduled_count ? "good" : "bad") +
-    stat("未排上", s.unscheduled_count, s.unscheduled_count ? "bad" : "good") +
+    stat("可启动（下界）", s.lower_bound + " / " + s.pod_count, s.lower_bound ? "good" : "bad") +
+    stat("可启动上界", s.upper_bound, s.optimal ? "good" : "warn") +
+    stat("最优性", s.optimal ? "已证最优" : "未证最优", s.optimal ? "good" : "warn") +
     stat("已分配 PVC", s.assigned_claim_count + " / " + s.claim_count) +
-    stat("PV 总数", s.pv_count);
+    stat("未排上", s.unscheduled_count, s.unscheduled_count ? "bad" : "good") +
+    stat(
+      "待确认",
+      s.unconfirmed_count,
+      s.unconfirmed_count ? "warn" : "good"
+    ) +
+    stat("PV 总数", s.pv_count) +
+    stat("Pod 总数", s.pod_count);
 
   const warningsEl = $("#warnings");
   if (data.warnings && data.warnings.length) {
@@ -157,6 +232,10 @@ function render(data) {
       (data.summary.pod_count ? "没有 Pod 能被排上。" : "清单中没有待启动的 Pod。") +
       "</div>";
 
+  const unconfirmedCount = unscheduledPods.filter((p) => p.status === "unconfirmed").length;
+  $("#unscheduled-title").textContent = unconfirmedCount
+    ? "未排上 / 待确认的 Pod（未证最优，待确认项可能在更长时限后排上）"
+    : "未排上的 Pod";
   $("#unscheduled-list").innerHTML = unscheduledPods.length
     ? unscheduledPods.map(renderPod).join("")
     : '<div class="empty">' +
@@ -207,11 +286,27 @@ runBtn.addEventListener("click", () => {
     setStatus("缺少输入", "error");
     return;
   }
+  const minPods = minPodsInput.value.trim();
+  const timeLimit = timeLimitInput.value.trim();
+  const localErrors = [];
+  if (minPods !== "" && (!/^\d+$/.test(minPods) || Number(minPods) < 0)) {
+    localErrors.push("最低上线 Pod 数必须是非负整数");
+  }
+  if (timeLimit !== "" && (!/^\d+$/.test(timeLimit) || Number(timeLimit) <= 0)) {
+    localErrors.push("求解时限（毫秒）必须是正整数");
+  }
+  if (localErrors.length) {
+    showErrors(localErrors);
+    setStatus("参数有误", "error");
+    return;
+  }
   runPlan(text);
 });
 
 clearBtn.addEventListener("click", () => {
   jsonInput.value = "";
+  minPodsInput.value = "";
+  timeLimitInput.value = "";
   clearErrors();
   resultsEl.hidden = true;
   emptyState.hidden = false;

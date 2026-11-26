@@ -94,6 +94,79 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 422)
         self.assertIn("JSON 解析失败", resp.json()["detail"][0])
 
+    def test_plan_accepts_min_pods_and_time_limit_in_body(self):
+        resp = self.client.post(
+            "/api/plan",
+            json={"json_text": self.sample_text, "min_pods": 5, "time_limit_ms": 5000},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["release"]["status"], "go")
+        self.assertEqual(data["search"]["time_limit_ms"], 5000)
+        self.assertEqual(data["search"]["min_pods"], 5)
+
+    def test_plan_accepts_options_in_query(self):
+        resp = self.client.post(
+            "/api/plan?min_pods=6&time_limit_ms=3000",
+            json={"json_text": self.sample_text},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["release"]["status"], "postpone")
+        self.assertEqual(data["search"]["time_limit_ms"], 3000)
+
+    def test_plan_rejects_invalid_options_with_chinese_422(self):
+        resp = self.client.post(
+            "/api/plan", json={"json_text": self.sample_text, "time_limit_ms": 0}
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("大于 0", resp.json()["detail"][0])
+        resp = self.client.post(
+            "/api/plan?min_pods=99", json={"json_text": self.sample_text}
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("上限", resp.json()["detail"][0])
+        resp = self.client.post(
+            "/api/plan?time_limit_ms=abc", json={"json_text": self.sample_text}
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("整数", resp.json()["detail"][0])
+
+    def test_plan_json_strips_option_fields(self):
+        payload = json.loads(self.sample_text)
+        payload["min_pods"] = 5
+        resp = self.client.post("/api/plan/json", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["release"]["status"], "go")
+
+    def test_upload_accepts_query_and_form_options(self):
+        resp = self.client.post(
+            "/api/plan/upload?min_pods=6",
+            files={"file": ("c.json", self.sample_text.encode(), "application/json")},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["release"]["status"], "postpone")
+        resp = self.client.post(
+            "/api/plan/upload",
+            data={"time_limit_ms": "1000"},
+            files={"file": ("c.json", self.sample_text.encode(), "application/json")},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["search"]["time_limit_ms"], 1000)
+
+    def test_response_contains_search_release_and_status_fields(self):
+        resp = self.client.post(
+            "/api/plan", json={"json_text": self.sample_text, "min_pods": 5}
+        )
+        data = resp.json()
+        for key in ("search", "release", "summary"):
+            self.assertIn(key, data)
+        for key in ("lower_bound", "upper_bound", "optimal", "timed_out", "elapsed_ms"):
+            self.assertIn(key, data["search"])
+        for pod in data["pods"]:
+            self.assertIn("status", pod)
+            self.assertIn("status_text", pod)
+
     def test_unknown_sample_404(self):
         self.assertEqual(self.client.get("/api/samples/nope").status_code, 404)
 

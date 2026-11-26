@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 MAX_PVS = 16
 MAX_PODS = 6
@@ -315,7 +316,76 @@ class _Matcher:
         return False
 
 
-def _solve(pvs: List[PV], pods: List[Pod]) -> Dict[str, Any]:
+def normalize_options(
+    min_pods: Any = None, time_limit_ms: Any = None
+) -> Tuple[Optional[int], Optional[int]]:
+    """校验并归一化「最低上线 Pod 数」与「求解时限（毫秒）」。
+
+    None / 空字符串视为未填写；min_pods 允许 0，time_limit_ms 必须为正整数。
+    """
+    errors: List[str] = []
+
+    def _parse_int(value: Any, field: str, allow_zero: bool) -> Optional[int]:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if isinstance(value, bool):
+            errors.append(f"{field} 必须是整数")
+            return None
+        if isinstance(value, str):
+            # query/form 传进来的是字符串：接受纯整数写法，拒绝 1.5、abc 等。
+            text = value.strip()
+            if not re.fullmatch(r"\d+", text):
+                errors.append(f"{field} 必须是整数")
+                return None
+            value = int(text)
+        if not isinstance(value, int):
+            errors.append(f"{field} 必须是整数")
+            return None
+        if value < 0 or (value == 0 and not allow_zero):
+            errors.append(f"{field} 必须{'是非负整数' if allow_zero else '大于 0'}")
+            return None
+        return value
+
+    min_pods_value = _parse_int(min_pods, "最低上线 Pod 数（min_pods）", allow_zero=True)
+    time_limit_value = _parse_int(
+        time_limit_ms, "求解时限毫秒（time_limit_ms）", allow_zero=False
+    )
+    if min_pods_value is not None and min_pods_value > MAX_PODS:
+        errors.append(f"最低上线 Pod 数不能超过上限 {MAX_PODS}")
+    if errors:
+        raise ValidationError(errors)
+    return min_pods_value, time_limit_value
+
+
+def _greedy_seed(
+    pods: List[Pod],
+    pod_claim_items: Dict[str, List[Tuple[ClaimKey, Claim]]],
+    individually_feasible: Dict[str, List[str]],
+    matcher: "_Matcher",
+) -> Tuple[int, Dict[str, str], Dict[str, ClaimKey], Dict[ClaimKey, str]]:
+    """顺序贪心给出一个可行初解，保证时限极短也有可交付的分配。"""
+    matches: Dict[str, ClaimKey] = {}
+    node_of_claim: Dict[ClaimKey, str] = {}
+    chosen: Dict[str, str] = {}
+    for pod in pods:
+        for node in sorted(individually_feasible[pod.name]):
+            placed = matcher.try_place(
+                pod_claim_items[pod.name], node, matches, node_of_claim
+            )
+            if placed is not None:
+                matches, node_of_claim = placed
+                chosen[pod.name] = node
+                break
+    return len(chosen), chosen, matches, node_of_claim
+
+
+def _solve(
+    pvs: List[PV],
+    pods: List[Pod],
+    min_pods: Optional[int] = None,
+    time_limit_ms: Optional[int] = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> Dict[str, Any]:
     claims_by_key: Dict[ClaimKey, Claim] = {}
     pod_claim_items: Dict[str, List[Tuple[ClaimKey, Claim]]] = {}
     for pod in pods:
@@ -338,9 +408,23 @@ def _solve(pvs: List[PV], pods: List[Pod]) -> Dict[str, Any]:
                 nodes.append(node)
         individually_feasible[pod.name] = nodes
 
-    best_count = 0
-    best_nodes: Dict[str, str] = {}
-    best_matches: Dict[str, ClaimKey] = {}
+    start = clock()
+    deadline = start + time_limit_ms / 1000.0 if time_limit_ms else None
+
+    # 贪心初解：即使第一次检查就超时，手上也有一份合法分配。
+    seed_count, seed_nodes, seed_matches, _ = _greedy_seed(
+        pods, pod_claim_items, individually_feasible, matcher
+    )
+    best_count = seed_count
+    best_nodes = dict(seed_nodes)
+    best_matches = dict(seed_matches)
+
+    timed_out = False
+    # open_bounds 保存「尚未进入的兄弟分支」的乐观上界；
+    # 每条分支上界 = 已选数 + 剩余未决 Pod 数，已跳过的 Pod 不计入。
+    open_bounds: List[int] = []
+    # 时限触发时所在节点自身子树的上界（只会记录一次）。
+    timeout_node_bounds: List[int] = []
 
     def dfs(
         index: int,
@@ -348,32 +432,70 @@ def _solve(pvs: List[PV], pods: List[Pod]) -> Dict[str, Any]:
         node_of_claim: Dict[ClaimKey, str],
         chosen: Dict[str, str],
     ) -> None:
-        nonlocal best_count, best_nodes, best_matches
+        nonlocal best_count, best_nodes, best_matches, timed_out
+        if timed_out:
+            return
+        if deadline is not None and clock() >= deadline:
+            timed_out = True
+            # 当前节点整棵子树尚未探索，它的乐观上界必须计入，
+            # 否则提前停止时给出的上界可能低于真实最优。
+            timeout_node_bounds.append(len(chosen) + (len(pods) - index))
+            return
         if index == len(pods):
             if len(chosen) > best_count:
                 best_count = len(chosen)
                 best_nodes = dict(chosen)
                 best_matches = dict(matches)
             return
-        if len(chosen) + (len(pods) - index) <= best_count:
+
+        bound = len(chosen) + (len(pods) - index)
+        if bound <= best_count:
+            # 已被定界剪枝：该分支被排除，上界不再纳入
+            # （其乐观上界不超过当前 best，纳不纳入都不会抬高结果）。
             return
 
         pod = pods[index]
+        children: List[
+            Tuple[str, Tuple[Dict[str, ClaimKey], Dict[ClaimKey, str]]]
+        ] = []
         for node in sorted(individually_feasible[pod.name]):
             placed = matcher.try_place(
                 pod_claim_items[pod.name], node, matches, node_of_claim
             )
-            if placed is None:
-                continue
+            if placed is not None:
+                children.append((node, placed))
+
+        for node, placed in children:
+            # 其余放置兄弟分支尚未探索，乐观上界与本节点相同。
+            open_bounds.append(bound)
             new_matches, new_node_of_claim = placed
             chosen[pod.name] = node
             dfs(index + 1, new_matches, new_node_of_claim, chosen)
             del chosen[pod.name]
+            if timed_out:
+                # 超时向上返回：不弹出残留的兄弟分支上界，
+                # 这些未排除分支要参与最终上界。
+                return
+            open_bounds.pop()
 
-        # 该 Pod 本次不启动。
+        # 跳过分支：当前 Pod 不启动，上界扣除这一个 Pod。
+        open_bounds.append(bound - 1)
         dfs(index + 1, matches, node_of_claim, chosen)
+        if timed_out:
+            return
+        open_bounds.pop()
 
     dfs(0, {}, {}, {})
+
+    elapsed_ms = max(0, int(round((clock() - start) * 1000)))
+    if timed_out:
+        # 上界 = 当前分配数 与 各未排除分支上限 中的最大值。
+        upper_bound = max([best_count] + open_bounds + timeout_node_bounds)
+        optimal = False
+    else:
+        upper_bound = best_count
+        optimal = True
+    lower_bound = best_count
 
     assigned_by_pod: Dict[str, Dict[str, str]] = {
         pod.name: {} for pod in pods
@@ -428,6 +550,8 @@ def _solve(pvs: List[PV], pods: List[Pod]) -> Dict[str, Any]:
                     ],
                     "assignments": assignments,
                     "scheduled": True,
+                    "status": "scheduled",
+                    "status_text": "已分配",
                     "reason": None,
                     "blocking": [],
                 }
@@ -442,6 +566,14 @@ def _solve(pvs: List[PV], pods: List[Pod]) -> Dict[str, Any]:
             best_matches,
             pv_holder,
         )
+        # 未证最优时，没分到卷的 Pod 仍有可能在未探索分支里排上，标为待确认。
+        if optimal:
+            status = "unscheduled"
+            status_text = "未排上"
+        else:
+            status = "unconfirmed"
+            status_text = "待确认"
+            reason = "搜索在求解时限内停止，尚未证明该 Pod 无法排上：" + reason
         unscheduled_pods.append(
             {
                 "name": pod.name,
@@ -457,6 +589,8 @@ def _solve(pvs: List[PV], pods: List[Pod]) -> Dict[str, Any]:
                 ],
                 "assignments": [],
                 "scheduled": False,
+                "status": status,
+                "status_text": status_text,
                 "reason": reason,
                 "blocking": blocking,
             }
@@ -480,17 +614,61 @@ def _solve(pvs: List[PV], pods: List[Pod]) -> Dict[str, Any]:
             scheduled_by_name.get(pod.name) or unscheduled_by_name[pod.name]
         )
 
+    # 发布判定：手上的分配够数 → 可上线；上界仍不够 → 推迟；其余 → 待复核。
+    if min_pods is None:
+        release_status = "not_requested"
+        release_text = "未填写最低上线 Pod 数，未做发布判定"
+    elif lower_bound >= min_pods:
+        release_status = "go"
+        release_text = f"可上线：当前已能启动 {lower_bound} 个 Pod，达到最低 {min_pods} 个"
+    elif upper_bound < min_pods:
+        release_status = "postpone"
+        release_text = (
+            f"建议推迟：可启动数量上界仅 {upper_bound} 个，"
+            f"达不到最低 {min_pods} 个"
+        )
+    else:
+        release_status = "review"
+        release_text = (
+            f"待复核：当前仅能启动 {lower_bound} 个（不足 {min_pods} 个），"
+            f"但上界 {upper_bound} 个仍可能达标"
+        )
+
+    search = {
+        "time_limit_ms": time_limit_ms,
+        "timed_out": timed_out,
+        "optimal": optimal,
+        "lower_bound": lower_bound,
+        "upper_bound": upper_bound,
+        "elapsed_ms": elapsed_ms,
+        "min_pods": min_pods,
+    }
+    release = {
+        "min_pods": min_pods,
+        "status": release_status,
+        "status_text": release_text,
+    }
+
     summary = {
         "pv_count": len(pvs),
         "pod_count": len(pods),
         "scheduled_count": len(scheduled_pods),
         "unscheduled_count": len(unscheduled_pods),
+        "unconfirmed_count": (
+            len(unscheduled_pods) if not optimal else 0
+        ),
         "claim_count": sum(len(pod.claims) for pod in pods),
         "assigned_claim_count": len(best_matches),
+        "lower_bound": lower_bound,
+        "upper_bound": upper_bound,
+        "optimal": optimal,
+        "timed_out": timed_out,
     }
     return {
         "limits": {"max_pvs": MAX_PVS, "max_pods": MAX_PODS},
         "summary": summary,
+        "search": search,
+        "release": release,
         "pvs": pv_details,
         "pods": pod_details,
         "scheduled": [item["name"] for item in scheduled_pods],
@@ -578,14 +756,33 @@ def _explain_unscheduled(
     )
 
 
-def plan(payload: Any) -> Dict[str, Any]:
+def plan(
+    payload: Any,
+    min_pods: Any = None,
+    time_limit_ms: Any = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> Dict[str, Any]:
+    min_pods_value, time_limit_value = normalize_options(min_pods, time_limit_ms)
     pvs, pods = parse_payload(payload)
-    return _solve(pvs, pods)
+    return _solve(
+        pvs,
+        pods,
+        min_pods=min_pods_value,
+        time_limit_ms=time_limit_value,
+        clock=clock,
+    )
 
 
-def plan_json_text(text: str) -> Dict[str, Any]:
+def plan_json_text(
+    text: str, min_pods: Any = None, time_limit_ms: Any = None
+) -> Dict[str, Any]:
+    min_pods_value, time_limit_value = normalize_options(min_pods, time_limit_ms)
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValidationError([f"JSON 解析失败：第 {exc.lineno} 行第 {exc.colno} 列，{exc.msg}"])
-    return plan(payload)
+    return plan(
+        payload,
+        min_pods=min_pods_value,
+        time_limit_ms=time_limit_value,
+    )

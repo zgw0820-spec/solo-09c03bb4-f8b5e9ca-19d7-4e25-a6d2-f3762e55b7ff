@@ -12,12 +12,61 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from app.solver import MAX_PODS, MAX_PVS, ValidationError, plan  # noqa: E402
+from app.solver import (  # noqa: E402
+    MAX_PODS,
+    MAX_PVS,
+    ValidationError,
+    normalize_options,
+    plan,
+)
 from bruteforce import max_schedulable, valid_solution  # noqa: E402
+
+
+class FakeClock:
+    """第 1 次调用（求解器记录 start）返回 0；之后第 fail_on_call 次取钟触发超时。"""
+
+    def __init__(self, fail_on_call: int):
+        self.calls = 0
+        self.fail_on_call = fail_on_call
+
+    def __call__(self) -> float:
+        self.calls += 1
+        if self.calls == 1:
+            return 0.0
+        return 2000.0 if (self.calls - 1) >= self.fail_on_call else 0.0
 
 
 def load_sample() -> dict:
     return json.loads((ROOT / "app" / "samples" / "contention.json").read_text())
+
+
+def bulky_payload() -> dict:
+    # 贪心陷阱：bulky 占两块盘，放掉它可启动 3 个 tiny；暴力最优为 3。
+    return {
+        "persistent_volumes": [
+            {"name": "pv-large", "node": "n1", "storage_class": "fast", "capacity_gi": 100},
+            {"name": "pv-tiny-a", "node": "n1", "storage_class": "fast", "capacity_gi": 10},
+            {"name": "pv-tiny-b", "node": "n1", "storage_class": "fast", "capacity_gi": 10},
+        ],
+        "pods": [
+            {
+                "name": "bulky",
+                "candidate_nodes": ["n1"],
+                "claims": [
+                    {"name": "data", "storage_class": "fast", "capacity_gi": 90},
+                    {"name": "wal", "storage_class": "fast", "capacity_gi": 10},
+                ],
+            },
+            *[
+                {
+                    "name": f"tiny-{i}",
+                    "candidate_nodes": ["n1"],
+                    "claims": [{"name": "c", "storage_class": "fast", "capacity_gi": 10}],
+                }
+                for i in range(1, 4)
+            ],
+        ],
+    }
 
 
 class SampleTests(unittest.TestCase):
@@ -264,6 +313,146 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(plan(payload)["summary"]["scheduled_count"], 1)
 
 
+class TimeLimitTests(unittest.TestCase):
+    """时限停止、上下界与发布判定。"""
+
+    def test_no_time_limit_runs_exactly_and_bounds_coincide(self):
+        result = plan(load_sample())
+        search = result["search"]
+        self.assertFalse(search["timed_out"])
+        self.assertTrue(search["optimal"])
+        self.assertEqual(search["lower_bound"], search["upper_bound"])
+        self.assertEqual(search["lower_bound"], 5)
+        # 精确求解时没分到卷的 Pod 仍是「未排上」。
+        self.assertTrue(
+            all(p["status"] == "unscheduled" for p in result["pods"] if not p["scheduled"])
+        )
+
+    def test_timeout_marks_not_optimal_and_unconfirmed(self):
+        result = plan(bulky_payload(), time_limit_ms=1000, clock=FakeClock(1))
+        search = result["search"]
+        self.assertTrue(search["timed_out"])
+        self.assertFalse(search["optimal"])
+        self.assertLessEqual(search["lower_bound"], search["upper_bound"])
+        # 未证最优时，没分到卷的 Pod 一律标为待确认。
+        self.assertTrue(
+            all(p["status"] == "unconfirmed" for p in result["pods"] if not p["scheduled"])
+        )
+        self.assertGreaterEqual(result["summary"]["unconfirmed_count"], 1)
+        # 待确认原因要说明是时限停止、尚未证明排不上。
+        unconfirmed = next(p for p in result["pods"] if p["status"] == "unconfirmed")
+        self.assertIn("时限", unconfirmed["reason"])
+
+    def test_upper_bound_always_dominates_true_optimum(self):
+        payload = bulky_payload()
+        optimum = max_schedulable(payload)
+        saw_timeout = False
+        for trigger in range(1, 200):
+            result = plan(payload, time_limit_ms=1000, clock=FakeClock(trigger))
+            search = result["search"]
+            self.assertIsNone(valid_solution(payload, result), trigger)
+            self.assertLessEqual(search["lower_bound"], optimum, trigger)
+            self.assertLessEqual(optimum, search["upper_bound"], (trigger, search))
+            self.assertEqual(search["optimal"], not search["timed_out"])
+            saw_timeout = saw_timeout or search["timed_out"]
+        self.assertTrue(saw_timeout)
+
+    def test_timeout_upper_bound_deducts_skipped_pods(self):
+        # 根节点立即超时：上界是全部 Pod 数（4），下界是贪心初解。
+        result = plan(bulky_payload(), time_limit_ms=1000, clock=FakeClock(1))
+        self.assertEqual(result["search"]["upper_bound"], 4)
+        # 深入搜索后上界应能降到真实最优 3。
+        lowered = False
+        for trigger in range(2, 200):
+            r = plan(bulky_payload(), time_limit_ms=1000, clock=FakeClock(trigger))
+            if r["search"]["timed_out"] and r["search"]["upper_bound"] == 3:
+                lowered = True
+                break
+        self.assertTrue(lowered)
+
+    def test_timeout_always_returns_a_valid_assignment(self):
+        # 即便第一次 DFS 检查就超时，贪心初解也保证手上有合法分配。
+        for trigger in range(1, 30):
+            result = plan(bulky_payload(), time_limit_ms=1000, clock=FakeClock(trigger))
+            self.assertIsNone(valid_solution(bulky_payload(), result))
+            self.assertGreaterEqual(result["search"]["lower_bound"], 1)
+
+
+class ReleaseDecisionTests(unittest.TestCase):
+    def test_without_min_pods_no_decision(self):
+        result = plan(load_sample())
+        self.assertIsNone(result["release"]["min_pods"])
+        self.assertEqual(result["release"]["status"], "not_requested")
+
+    def test_go_when_current_assignment_meets_minimum(self):
+        result = plan(load_sample(), min_pods=5)
+        self.assertEqual(result["release"]["status"], "go")
+        self.assertIn("可上线", result["release"]["status_text"])
+        # 未证最优但下界已够数，同样判可上线。
+        early = plan(bulky_payload(), min_pods=2, time_limit_ms=1000, clock=FakeClock(1))
+        self.assertTrue(early["search"]["timed_out"])
+        self.assertEqual(early["release"]["status"], "go")
+
+    def test_postpone_when_upper_bound_below_minimum(self):
+        result = plan(load_sample(), min_pods=6)
+        self.assertEqual(result["release"]["status"], "postpone")
+        self.assertIn("推迟", result["release"]["status_text"])
+
+    def test_review_when_lower_below_minimum_but_upper_allows(self):
+        seen = False
+        for trigger in range(1, 200):
+            result = plan(
+                bulky_payload(),
+                min_pods=3,
+                time_limit_ms=1000,
+                clock=FakeClock(trigger),
+            )
+            if result["release"]["status"] == "review":
+                search = result["search"]
+                self.assertLess(search["lower_bound"], 3)
+                self.assertGreaterEqual(search["upper_bound"], 3)
+                self.assertIn("待复核", result["release"]["status_text"])
+                seen = True
+                break
+        self.assertTrue(seen)
+
+    def test_min_pods_zero_on_empty_input(self):
+        result = plan({"persistent_volumes": [], "pods": []}, min_pods=0)
+        self.assertEqual(result["release"]["status"], "go")
+        self.assertTrue(result["search"]["optimal"])
+
+
+class OptionValidationTests(unittest.TestCase):
+    def assert_rejected(self, kwargs, fragment):
+        with self.assertRaises(ValidationError) as ctx:
+            plan(load_sample(), **kwargs)
+        self.assertTrue(
+            any(fragment in message for message in ctx.exception.errors),
+            ctx.exception.errors,
+        )
+
+    def test_accepts_none_and_numeric_strings(self):
+        min_pods, time_limit = normalize_options("5", "200")
+        self.assertEqual((min_pods, time_limit), (5, 200))
+        min_pods, time_limit = normalize_options("  ", None)
+        self.assertIsNone(min_pods)
+        self.assertIsNone(time_limit)
+
+    def test_rejects_bad_options(self):
+        self.assert_rejected({"min_pods": -1}, "非负整数")
+        self.assert_rejected({"min_pods": MAX_PODS + 1}, "不能超过上限")
+        self.assert_rejected({"time_limit_ms": 0}, "大于 0")
+        self.assert_rejected({"time_limit_ms": -5}, "大于 0")
+        self.assert_rejected({"time_limit_ms": "abc"}, "整数")
+        self.assert_rejected({"time_limit_ms": 1.5}, "整数")
+        self.assert_rejected({"min_pods": True}, "整数")
+
+    def test_string_zero_time_limit_rejected_with_int_message(self):
+        with self.assertRaises(ValidationError) as ctx:
+            normalize_options(None, "0")
+        self.assertIn("大于 0", ctx.exception.errors[0])
+
+
 class RandomDifferentialTests(unittest.TestCase):
     """随机小规模输入上与暴力枚举对拍，验证最优性和约束合法性。"""
 
@@ -309,6 +498,16 @@ class RandomDifferentialTests(unittest.TestCase):
                 max_schedulable(payload),
                 f"case {case}: {payload} -> {result['scheduled']}",
             )
+            # 同一实例在多个超时触发点上：上界必须夹住暴力最优，解始终合法。
+            optimum = max_schedulable(payload)
+            for trigger in (1, 2, 4, 8):
+                stopped = plan(
+                    payload, time_limit_ms=1000, clock=FakeClock(trigger)
+                )
+                search = stopped["search"]
+                self.assertIsNone(valid_solution(payload, stopped), payload)
+                self.assertLessEqual(search["lower_bound"], optimum)
+                self.assertLessEqual(optimum, search["upper_bound"], search)
 
 
 if __name__ == "__main__":
