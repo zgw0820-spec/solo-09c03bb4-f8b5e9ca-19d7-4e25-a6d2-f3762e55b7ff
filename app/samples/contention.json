@@ -1,0 +1,67 @@
+{
+  "persistent_volumes": [
+    {"name": "pv-a-fast-100", "node": "node-a", "storage_class": "local-fast", "capacity_gi": 100},
+    {"name": "pv-a-slow-500", "node": "node-a", "storage_class": "local-slow", "capacity_gi": 500},
+    {"name": "pv-a-slow-250", "node": "node-a", "storage_class": "local-slow", "capacity_gi": 250},
+    {"name": "pv-a-slow-80", "node": "node-a", "storage_class": "local-slow", "capacity_gi": 80},
+    {"name": "pv-a-archive-800", "node": "node-a", "storage_class": "local-archive", "capacity_gi": 800},
+    {"name": "pv-b-fast-100", "node": "node-b", "storage_class": "local-fast", "capacity_gi": 100},
+    {"name": "pv-b-fast-90", "node": "node-b", "storage_class": "local-fast", "capacity_gi": 90},
+    {"name": "pv-b-slow-400", "node": "node-b", "storage_class": "local-slow", "capacity_gi": 400},
+    {"name": "pv-b-slow-150", "node": "node-b", "storage_class": "local-slow", "capacity_gi": 150},
+    {"name": "pv-b-archive-600", "node": "node-b", "storage_class": "local-archive", "capacity_gi": 600},
+    {"name": "pv-c-fast-120", "node": "node-c", "storage_class": "local-fast", "capacity_gi": 120},
+    {"name": "pv-c-fast-70", "node": "node-c", "storage_class": "local-fast", "capacity_gi": 70},
+    {"name": "pv-c-slow-300", "node": "node-c", "storage_class": "local-slow", "capacity_gi": 300},
+    {"name": "pv-c-slow-250", "node": "node-c", "storage_class": "local-slow", "capacity_gi": 250},
+    {"name": "pv-c-slow-100", "node": "node-c", "storage_class": "local-slow", "capacity_gi": 100},
+    {"name": "pv-c-archive-1000", "node": "node-c", "storage_class": "local-archive", "capacity_gi": 1000}
+  ],
+  "pods": [
+    {
+      "name": "postgres-0",
+      "candidate_nodes": ["node-a", "node-b"],
+      "claims": [
+        {"name": "pgdata", "storage_class": "local-fast", "capacity_gi": 100},
+        {"name": "pgwal", "storage_class": "local-fast", "capacity_gi": 50}
+      ]
+    },
+    {
+      "name": "kafka-0",
+      "candidate_nodes": ["node-a", "node-b"],
+      "claims": [
+        {"name": "kafka-data", "storage_class": "local-fast", "capacity_gi": 100},
+        {"name": "kafka-logs", "storage_class": "local-slow", "capacity_gi": 200}
+      ]
+    },
+    {
+      "name": "minio-0",
+      "candidate_nodes": ["node-b", "node-c"],
+      "claims": [
+        {"name": "minio-data", "storage_class": "local-slow", "capacity_gi": 300},
+        {"name": "minio-meta", "storage_class": "local-slow", "capacity_gi": 100}
+      ]
+    },
+    {
+      "name": "redis-0",
+      "candidate_nodes": ["node-a", "node-b"],
+      "claims": [
+        {"name": "redis-data", "storage_class": "local-fast", "capacity_gi": 80}
+      ]
+    },
+    {
+      "name": "web-0",
+      "candidate_nodes": ["node-a", "node-c"],
+      "claims": [
+        {"name": "web-assets", "storage_class": "local-slow", "capacity_gi": 60}
+      ]
+    },
+    {
+      "name": "metrics-0",
+      "candidate_nodes": ["node-c"],
+      "claims": [
+        {"name": "metrics-data", "storage_class": "local-fast", "capacity_gi": 120}
+      ]
+    }
+  ]
+}

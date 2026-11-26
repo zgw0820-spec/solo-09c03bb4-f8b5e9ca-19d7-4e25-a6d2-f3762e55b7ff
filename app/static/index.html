@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubernetes 本地盘上线预检</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◧</span>
+    <div>
+      <h1>Kubernetes 本地盘上线预检</h1>
+      <p class="sub">在 Pod 启动前，先算清楚本地 PV 能同时喂饱几个 Pod</p>
+    </div>
+  </div>
+  <a class="ghost-link" href="/docs" target="_blank" rel="noopener">API 文档</a>
+</header>
+
+<main class="layout">
+  <section class="panel input-panel">
+    <div class="panel-head">
+      <h2>1. 导入清单</h2>
+      <span class="limit-tag">≤ 16 块 PV · ≤ 6 个 Pod</span>
+    </div>
+
+    <div class="actions">
+      <button id="load-sample" class="btn primary" type="button">载入争用样例</button>
+      <label class="btn" for="file-input">选择 JSON 文件</label>
+      <input id="file-input" type="file" accept=".json,application/json" hidden>
+      <button id="clear-btn" class="btn subtle" type="button">清空</button>
+    </div>
+
+    <p class="hint">也可以把 JSON 直接粘贴到下面，然后点“开始试算”。</p>
+    <textarea id="json-input" spellcheck="false" aria-label="JSON 清单"></textarea>
+
+    <div class="actions">
+      <button id="run-btn" class="btn primary" type="button">开始试算</button>
+      <span id="status" class="status" role="status" aria-live="polite"></span>
+    </div>
+
+    <details class="schema">
+      <summary>清单格式说明</summary>
+      <pre>{
+  "persistent_volumes": [
+    {"name": "pv-a-fast-100", "node": "node-a",
+     "storage_class": "local-fast", "capacity_gi": 100}
+  ],
+  "pods": [
+    {"name": "postgres-0",
+     "candidate_nodes": ["node-a", "node-b"],
+     "claims": [
+       {"name": "pgdata", "storage_class": "local-fast", "capacity_gi": 100},
+       {"name": "pgwal",  "storage_class": "local-fast", "capacity_gi": 50}
+     ]}
+  ]
+}</pre>
+      <ul>
+        <li>PV：<code>name</code>、<code>node</code>、<code>storage_class</code>、<code>capacity_gi</code>（Gi 整数，也接受 <code>"100Gi"</code>）。</li>
+        <li>Pod：<code>candidate_nodes</code> 为可调度节点；<code>claims</code> 为需要独占的 PVC。</li>
+        <li>规则：StorageClass 相同且容量足够；一块 PV 只给一项 PVC；同一 Pod 的卷必须同节点。</li>
+      </ul>
+    </details>
+  </section>
+
+  <section class="panel result-panel" id="result-panel">
+    <div class="panel-head">
+      <h2>2. 试算结果</h2>
+      <span id="result-badge" class="badge muted">尚未试算</span>
+    </div>
+
+    <div id="error-box" class="error-box" hidden></div>
+
+    <div id="empty-state" class="empty">
+      <p>载入样例或粘贴清单后点击「开始试算」。</p>
+    </div>
+
+    <div id="results" hidden>
+      <div class="summary-grid" id="summary-grid"></div>
+      <div id="warnings" class="warnings" hidden></div>
+
+      <h3>可同时启动的 Pod</h3>
+      <div id="scheduled-list" class="pod-list"></div>
+
+      <h3>未排上的 Pod</h3>
+      <div id="unscheduled-list" class="pod-list"></div>
+
+      <h3>PV 使用情况</h3>
+      <div class="table-wrap">
+        <table id="pv-table">
+          <thead>
+            <tr><th>PV</th><th>节点</th><th>StorageClass</th><th class="num">容量</th><th>分配</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>本地盘 → Pod 亲和性是硬约束；一块盘绑错，整个 Pod 起不来。</span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
